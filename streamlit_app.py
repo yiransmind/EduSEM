@@ -1,190 +1,253 @@
-"""
-Streamlit App: No‑Code CFA & SEM Builder
-=======================================
-This single‑file Streamlit application lets **anyone**—even without coding
-skills—run a full measurement‑and‑structural model workflow on **any** tidy
-CSV dataset:
+"""streamlit_app.py – No‑Code CFA & SEM Builder
+================================================
+A **single‑file** Streamlit application that lets *anyone* upload a tidy CSV,
+create a measurement model, specify hypotheses (structural paths), run CFA/SEM
+with **semopy**, and download results tables – all without writing code.
 
-1. **Upload Dataset** (wide format, one row per respondent).  
-2. **Define Latent Constructs** by pointing‑and‑clicking observed variables.  
-3. **Build Hypotheses / Structural Paths** interactively.  
-4. **Estimate** CFA ➜ (optional) SEM with `semopy`.  
-5. **Download** every results table (fit indices, loadings, paths, …) as CSV.
-
-The file is totally self‑contained—just install the deps and run:  
+▶️ **How to run**
 ```bash
-pip install streamlit semopy pandas
+pip install streamlit pandas semopy openpyxl
 streamlit run streamlit_app.py
 ```
+
+------------------------------------------------------------
 """
 
-import streamlit as st
+import io
+from pathlib import Path
+from textwrap import dedent
+
 import pandas as pd
-import base64
-from semopy import Model, Optimizer
+import streamlit as st
 
-st.set_page_config(page_title="CFA‑SEM Builder", layout="wide")
+# Try importing semopy; if not present, inform the user gracefully
+try:
+    import semopy
+except ImportError:
+    semopy = None
 
-# ---------------------------------------------------------------------------
-# Session helpers
-# ---------------------------------------------------------------------------
+st.set_page_config(page_title="CFA & SEM Builder", page_icon="📐", layout="centered")
+st.title("📐 No‑Code CFA & SEM Builder")
 
-def _init_state():
-    """Initialize session‑state keys the first time the app runs."""
-    for key, default in (
-        ("data", None),
-        ("constructs", {}),        # {"SE": ["SE1", "SE2", ...], ...}
-        ("hypotheses", []),        # [{"lhs": "CSR", "rhs": "SE"}, ...]
-    ):
-        if key not in st.session_state:
-            st.session_state[key] = default
+# ----------------------------------------------------------------------------
+# Session‑state helpers -------------------------------------------------------
+# ----------------------------------------------------------------------------
 
-_init_state()
+def _init_session():
+    st.session_state.setdefault("df", None)           # Uploaded dataframe
+    st.session_state.setdefault("constructs", {})     # {latent: [items]}
+    st.session_state.setdefault("paths", [])          # List[(dep, pred)]
 
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
+_init_session()
 
-def _b64_download(df: pd.DataFrame, filename: str, label: str):
-    """Return an HTML download‑link for a dataframe."""
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    return f'<a href="data:file/csv;base64,{b64}" download="{filename}">{label}</a>'
+# ----------------------------------------------------------------------------
+# STEP 1 – Upload CSV ---------------------------------------------------------
+# ----------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Sidebar – Upload data
-# ---------------------------------------------------------------------------
+st.header("1. Upload Your Data 📄")
+file = st.file_uploader("Upload a tidy, numeric‑only CSV (wide format)", type=["csv"])
 
-st.sidebar.header("1. Upload CSV")
-file = st.sidebar.file_uploader("Select a tidy CSV file", type=["csv"])
 if file:
     try:
-        st.session_state.data = pd.read_csv(file)
-        st.sidebar.success(f"Loaded **{st.session_state.data.shape[0]} rows × {st.session_state.data.shape[1]} columns**.")
+        st.session_state.df = pd.read_csv(file)
     except Exception as e:
-        st.session_state.data = None
-        st.sidebar.error(f"Failed to read CSV: {e}")
+        st.error(f"Unable to read CSV: {e}")
+        st.stop()
+
+    st.success("Dataset loaded! Preview below (first 10 rows):")
+    st.dataframe(st.session_state.df.head(10), height=200)
 else:
-    st.sidebar.info("Awaiting CSV file…")
+    st.info("Awaiting CSV upload…")
+    st.stop()
 
-# ---------------------------------------------------------------------------
-# Main layout
-# ---------------------------------------------------------------------------
+# Ensure dataframe is numeric‑only (semopy requirement)
+if not st.session_state.df.select_dtypes(include="number").shape[1] == st.session_state.df.shape[1]:
+    st.warning("⚠️ All columns must be numeric for CFA/SEM. Non‑numeric columns were detected.")
 
-st.title("🔧 No‑Code CFA & SEM Builder")
-st.markdown("Design latent constructs, specify hypotheses, and estimate a full model—**all without writing code**.")
+# ----------------------------------------------------------------------------
+# STEP 2 – Define Measurement Model ------------------------------------------
+# ----------------------------------------------------------------------------
 
-if st.session_state.data is None:
-    st.stop()  # Wait until data uploaded
+st.header("2. Define Latent Constructs 🏗️")
+cols = list(st.session_state.df.columns)
 
-columns = list(st.session_state.data.columns)
-
-# =============================================================================
-# Step 2 – Define Constructs
-# =============================================================================
-
-st.header("2️⃣ Define Latent Constructs")
-name = st.text_input("Construct name", placeholder="e.g., SE")
-items = st.multiselect("Observed items (columns)", columns, key="item_select")
-add_col1, add_col2 = st.columns([1,3])
-with add_col1:
-    if st.button("Add/Update"):
-        if not name or not items:
-            st.warning("Please supply both a construct name and at least one item.")
+with st.expander("Add a new construct"):
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        new_latent = st.text_input("Construct name", key="latent_name")
+    with c2:
+        new_items = st.multiselect("Observed variables", cols, key="latent_items")
+    if st.button("➕ Add Construct"):
+        if not new_latent or not new_items:
+            st.warning("Provide a name **and** at least one item.")
+        elif new_latent in st.session_state.constructs:
+            st.warning("A construct with that name already exists.")
         else:
-            st.session_state.constructs[name.strip()] = items
-            st.success(f"Construct **{name.upper()}** saved.")
-with add_col2:
-    if st.button("Clear Constructs"):
-        st.session_state.constructs = {}
-        st.session_state.hypotheses = []
+            st.session_state.constructs[new_latent] = new_items
+            st.success(f"Added construct **{new_latent}**")
 
 if st.session_state.constructs:
     st.subheader("Current constructs")
-    st.dataframe(pd.DataFrame(
-        [(k, ", ".join(v)) for k, v in st.session_state.constructs.items()],
-        columns=["Construct", "Items"],
-    ), hide_index=True, height=200)
-
-# =============================================================================
-# Step 3 – Build Hypotheses (Structural Paths)
-# =============================================================================
-
-st.header("3️⃣ Build Hypotheses / Structural Paths")
-if not st.session_state.constructs:
-    st.info("Define at least one construct first.")
-    st.stop()
-
-construct_list = list(st.session_state.constructs.keys())
-col_dep, col_indep = st.columns(2)
-dep = col_dep.selectbox("Outcome (dependent construct)", construct_list, key="dep")
-indep_opts = [c for c in construct_list if c != dep]
-indeps = col_indep.multiselect("Predictor(s) (independent constructs)", indep_opts, key="indeps")
-
-hypo_cols = st.columns([1,5])
-with hypo_cols[0]:
-    if st.button("➕ Add Path(s)"):
-        new_paths = [
-            {"lhs": dep, "rhs": rhs}
-            for rhs in indeps
-            if not any(h["lhs"] == dep and h["rhs"] == rhs for h in st.session_state.hypotheses)
-        ]
-        st.session_state.hypotheses.extend(new_paths)
-        st.experimental_rerun()
-with hypo_cols[1]:
-    if st.button("🗑️ Clear All Paths"):
-        st.session_state.hypotheses = []
-        st.experimental_rerun()
-
-if st.session_state.hypotheses:
-    st.subheader("Hypothesis list")
-    st.dataframe(pd.DataFrame(st.session_state.hypotheses), hide_index=True, height=180)
+    for latent, items in st.session_state.constructs.items():
+        st.markdown(f"- **{latent}** ← {', '.join(items)}")
+    if st.button("❌ Clear all constructs"):
+        st.session_state.constructs.clear()
+        st.session_state.paths.clear()
 else:
-    st.info("No paths defined yet – add some above.")
+    st.info("Add at least one construct to continue…")
 
-# =============================================================================
-# Step 4 – Estimate CFA/SEM
-# =============================================================================
+# ----------------------------------------------------------------------------
+# STEP 3 – Build Hypotheses (Structural Paths) -------------------------------
+# ----------------------------------------------------------------------------
 
-st.header("4️⃣ Estimate Model & Download Results")
-est_btn = st.button("🚀 Run Model", disabled=not st.session_state.constructs)
+if st.session_state.constructs:
+    st.header("3. Build Hypotheses / Structural Paths 🔀")
 
-if est_btn:
-    # Build lavaan/semopy‑style syntax
-    meas_lines = [f"{k} =~ " + " + ".join(v) for k, v in st.session_state.constructs.items()]
-    struct_lines = [f"{h['lhs']} ~ {h['rhs']}" for h in st.session_state.hypotheses]
-    model_desc = "\n".join(meas_lines + struct_lines)
+    # Helper to avoid stale options after construct changes
+    construct_names = list(st.session_state.constructs.keys())
 
-    st.subheader("Model specification")
-    st.code(model_desc, language="text")
+    with st.form("add_path_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            dep = st.selectbox("Outcome (dependent construct)", construct_names, key="dep_select")
+        with col2:
+            preds = st.multiselect(
+                "Predictor construct(s)",
+                options=[c for c in construct_names if c != dep],
+                key="pred_select",
+            )
+        submitted = st.form_submit_button("Add path(s)")
 
-    try:
-        model = Model(model_desc)
-        optim = Optimizer(model)
-        optim.optimize(st.session_state.data)
+        if submitted:
+            if not preds:
+                st.warning("Select at least one predictor.")
+            else:
+                added_any = False
+                for pred in preds:
+                    path = (dep, pred)
+                    if path not in st.session_state.paths:
+                        st.session_state.paths.append(path)
+                        added_any = True
+                if added_any:
+                    st.success("Path(s) added!")
+                else:
+                    st.info("No new paths were added (possible duplicates).")
 
-        st.success("Model estimated successfully!")
-        stats = model.calc_stats()
+    # Display current hypotheses table
+    if st.session_state.paths:
+        path_df = pd.DataFrame(
+            {
+                "Outcome": [p[0] for p in st.session_state.paths],
+                "Predictor": [p[1] for p in st.session_state.paths],
+            }
+        )
+        st.dataframe(path_df, height=min(400, 35 * len(path_df) + 40))
+        if st.button("❌ Clear all hypotheses"):
+            st.session_state.paths.clear()
+            st.success("All hypotheses cleared.")
+    else:
+        st.info("No paths yet – add at least one above.")
 
-        # Fit indices
-        st.subheader("Fit indices")
-        fit_df = stats[["n", "chisq", "df", "p-value", "cfi", "tli", "rmsea", "aic"]]
-        st.dataframe(fit_df, hide_index=True)
-        st.markdown(_b64_download(fit_df.reset_index(), "fit_indices.csv", "⬇️ Download Fit CSV"), unsafe_allow_html=True)
+# ----------------------------------------------------------------------------
+# STEP 4 – Run CFA/SEM --------------------------------------------------------
+# ----------------------------------------------------------------------------
 
-        # Standardized loadings
-        st.subheader("Standardized loadings")
-        load_df = model.inspect()["lambda"]
-        st.dataframe(load_df.style.format("{:.3f}"))
-        st.markdown(_b64_download(load_df.reset_index(), "loadings.csv", "⬇️ Download Loadings CSV"), unsafe_allow_html=True)
+if st.session_state.constructs and st.session_state.paths:
+    st.header("4. Estimate Model & Download Results 📊")
 
-        # Path estimates (only if structural part exists)
-        if struct_lines:
-            st.subheader("Path coefficients")
-            path_df = model.inspect()["beta"]
-            st.dataframe(path_df.style.format("{:.3f}"))
-            st.markdown(_b64_download(path_df.reset_index(), "path_coeffs.csv", "⬇️ Download Paths CSV"), unsafe_allow_html=True)
+    if semopy is None:
+        st.error(
+            "`semopy` is not installed. Run `pip install semopy` in your environment "
+            "and restart the app."
+        )
+        st.stop()
 
-    except Exception as exc:
-        st.error(f"Estimation failed: {exc}")
+    if st.button("🚀 Run CFA + SEM"):
+        with st.spinner("Fitting model… this may take a moment"):
+            # ------------------------------------------------------------------
+            # Build semopy model description
+            # ------------------------------------------------------------------
+            lines = []
+            for latent, items in st.session_state.constructs.items():
+                lines.append(f"{latent} =~ " + " + ".join(items))
+            for dep, pred in st.session_state.paths:
+                lines.append(f"{dep} ~ {pred}")
+            model_desc = "\n".join(lines)
 
+            # Fit model
+            try:
+                mod = semopy.Model(model_desc)
+                mod.fit(st.session_state.df.dropna())  # drop rows with missing
+            except Exception as e:
+                st.error(f"Model failed to converge or is misspecified: {e}")
+                st.stop()
+
+            # ------------------------------------------------------------------
+            # Collect outputs
+            # ------------------------------------------------------------------
+            estimates = semopy.inspect(mod)
+            stat_res = mod.calc_stats()
+
+            # Fit indices summary
+            fit_summary = {
+                "Chi2": stat_res.chi2,
+                "df": stat_res.dof,
+                "p": stat_res.p_value,
+                "CFI": stat_res.cfi,
+                "TLI": stat_res.tli,
+                "RMSEA": stat_res.rmsea,
+                "SRMR": stat_res.srmr,
+            }
+            fit_df = pd.DataFrame(fit_summary, index=["SEM"])
+
+            # Standardized paths only
+            std_paths = estimates.loc[estimates["op"] == "~"][[
+                "lval", "rval", "Est", "SE", "Z", "pval", "StdEst"]
+            ].rename(columns={
+                "lval": "Outcome",
+                "rval": "Predictor",
+                "Est": "β (unstd)",
+                "StdEst": "β (std)",
+                "Z": "z",
+                "pval": "p",
+            })
+
+            # Reliability (Cronbach's alpha) – simple average inter‑item corr.
+            reliab_rows = []
+            for latent, items in st.session_state.constructs.items():
+                sub = st.session_state.df[items]
+                # Avg. inter‑item correlation (r_bar)
+                r_bar = sub.corr().where(~pd.eye(len(items), dtype=bool)).stack().mean()
+                alpha = (len(items) * r_bar) / (1 + (len(items) - 1) * r_bar) if len(items) > 1 else 0
+                reliab_rows.append({"Construct": latent, "Cronbach α": round(alpha, 3)})
+            alpha_df = pd.DataFrame(reliab_rows)
+
+            # ------------------------------------------------------------------
+            # Show results in the UI
+            # ------------------------------------------------------------------
+            st.subheader("Model Fit Indices")
+            st.table(fit_df.round(3))
+
+            st.subheader("Standardized Path Estimates (Hypotheses)")
+            st.dataframe(std_paths.round(3))
+
+            st.subheader("Reliability (Cronbach's α)")
+            st.table(alpha_df)
+
+            # ------------------------------------------------------------------
+            # Download buttons
+            # ------------------------------------------------------------------
+            def _csv_download(df: pd.DataFrame, label: str, fname: str):
+                csv = df.to_csv(index=False).encode()
+                st.download_button(
+                    label=f"⬇️ Download {label}",
+                    data=csv,
+                    file_name=fname,
+                    mime="text/csv",
+                )
+
+            _csv_download(fit_df, "fit indices", "model_fit_indices.csv")
+            _csv_download(std_paths, "hypothesis tests", "hypothesis_results.csv")
+            _csv_download(alpha_df, "reliability table", "reliability.csv")
+
+            st.success("Done! Scroll up for tables and use the buttons to download.")
